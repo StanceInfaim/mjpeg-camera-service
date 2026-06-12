@@ -1,8 +1,10 @@
 package com.stanceinfaim.mjpegcamera;
 
+import android.app.AlarmManager;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
@@ -15,12 +17,15 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
+import android.os.Looper;
+import android.os.PowerManager;
 import android.util.Log;
 import android.util.Size;
 
+import androidx.annotation.NonNull;
+
 import java.io.*;
 import java.net.*;
-import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.concurrent.atomic.AtomicReference;
@@ -38,19 +43,44 @@ public class CameraStreamService extends Service {
     private CameraDevice cameraDevice;
     private CameraCaptureSession captureSession;
     private ImageReader imageReader;
+    private PowerManager.WakeLock wakeLock;
 
     private final AtomicReference<byte[]> latestFrame = new AtomicReference<>(null);
     private String currentCameraId = "0";
     private volatile boolean running = false;
+    
+    private final Handler retryHandler = new Handler(Looper.getMainLooper());
+    private boolean isCameraConnected = false;
 
     @Override
     public void onCreate() {
         super.onCreate();
+        
+        Thread.setDefaultUncaughtExceptionHandler((thread, throwable) -> {
+            Log.e(TAG, "Критический краш! Перезапуск сервиса через 1 сек...", throwable);
+            Intent amIntent = new Intent(getApplicationContext(), CameraStreamService.class);
+            PendingIntent pendingIntent = PendingIntent.getForegroundService(
+                    getApplicationContext(), 0, amIntent, PendingIntent.FLAG_IMMUTABLE);
+            AlarmManager mgr = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+            if (mgr != null) {
+                mgr.set(AlarmManager.RTC, System.currentTimeMillis() + 1000, pendingIntent);
+            }
+            System.exit(2);
+        });
+
         startForeground(1, buildNotification());
+        
+        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        if (pm != null) {
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "MJPEGCamera::WakeLock");
+            wakeLock.acquire();
+        }
+
         cameraManager = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
         cameraThread = new HandlerThread("CameraThread");
         cameraThread.start();
         cameraHandler = new Handler(cameraThread.getLooper());
+        
         openCamera(currentCameraId);
         startHttpServer();
     }
@@ -74,86 +104,125 @@ public class CameraStreamService extends Service {
         running = false;
         closeCamera();
         try { if (serverSocket != null) serverSocket.close(); } catch (Exception ignored) {}
-        cameraThread.quitSafely();
+        if (cameraThread != null) cameraThread.quitSafely();
+        if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+        retryHandler.removeCallbacksAndMessages(null);
         super.onDestroy();
     }
 
     private void openCamera(String cameraId) {
-        closeCamera();
         try {
-            CameraCharacteristics chars = cameraManager.getCameraCharacteristics(cameraId);
-            StreamConfigurationMap map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
-            Size[] sizes = map.getOutputSizes(ImageFormat.JPEG);
-            Size chosen = pickSize(sizes, 1280, 720);
-
-            imageReader = ImageReader.newInstance(chosen.getWidth(), chosen.getHeight(), ImageFormat.JPEG, 3);
-            imageReader.setOnImageAvailableListener(reader -> {
-                try (Image image = reader.acquireLatestImage()) {
-                    if (image == null) return;
-                    ByteBuffer buf = image.getPlanes()[0].getBuffer();
-                    byte[] bytes = new byte[buf.remaining()];
-                    buf.get(bytes);
-                    latestFrame.set(bytes);
-                }
-            }, cameraHandler);
-
             cameraManager.openCamera(cameraId, new CameraDevice.StateCallback() {
                 @Override
-                public void onOpened(CameraDevice camera) {
+                public void onOpened(@NonNull CameraDevice camera) {
+                    Log.i(TAG, "Камера успешно открыта!");
+                    isCameraConnected = true;
                     cameraDevice = camera;
-                    startPreview();
+                    currentCameraId = cameraId;
+                    startCaptureSession();
                 }
+
                 @Override
-                public void onDisconnected(CameraDevice camera) { camera.close(); }
+                public void onDisconnected(@NonNull CameraDevice camera) {
+                    Log.w(TAG, "Камера отключена, переподключение...");
+                    isCameraConnected = false;
+                    closeCamera();
+                    scheduleCameraRetry();
+                }
+
                 @Override
-                public void onError(CameraDevice camera, int error) {
-                    Log.e(TAG, "Camera error: " + error);
-                    camera.close();
+                public void onError(@NonNull CameraDevice camera, int error) {
+                    Log.e(TAG, "Ошибка камеры: " + error);
+                    isCameraConnected = false;
+                    closeCamera();
+                    scheduleCameraRetry();
                 }
             }, cameraHandler);
 
-            currentCameraId = cameraId;
         } catch (Exception e) {
-            Log.e(TAG, "openCamera failed", e);
+            Log.e(TAG, "Не удалось вызвать openCamera (система блокирует из фона). Пробуем снова...", e);
+            scheduleCameraRetry();
         }
     }
 
-    private void startPreview() {
+    private void scheduleCameraRetry() {
+        if (!isCameraConnected) {
+            retryHandler.removeCallbacksAndMessages(null);
+            retryHandler.postDelayed(() -> openCamera(currentCameraId), 3000); 
+        }
+    }
+    
+    private void startCaptureSession() {
         try {
+            closeCameraStructures();
+
+            CameraCharacteristics characteristics = cameraManager.getCameraCharacteristics(currentCameraId);
+            StreamConfigurationMap map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+            Size[] sizes = map != null ? map.getOutputSizes(ImageFormat.JPEG) : new Size[]{new Size(1280, 720)};
+            Size optimalSize = pickSize(sizes, 1280, 720);
+
+            imageReader = ImageReader.newInstance(optimalSize.getWidth(), optimalSize.getHeight(), ImageFormat.JPEG, 2);
+            imageReader.setOnImageAvailableListener(reader -> {
+                try (Image image = reader.acquireLatestImage()) {
+                    if (image != null) {
+                        Image.Plane[] planes = image.getPlanes();
+                        if (planes.length > 0) {
+                            ByteBuffer buffer = planes[0].getBuffer();
+                            byte[] bytes = new byte[buffer.remaining()];
+                            buffer.get(bytes);
+                            latestFrame.set(bytes);
+                        }
+                    }
+                } catch (Exception e) {
+                    Log.e(TAG, "Ошибка чтения кадра из ImageReader", e);
+                }
+            }, cameraHandler);
+
             CaptureRequest.Builder builder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
             builder.addTarget(imageReader.getSurface());
             builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
+
             cameraDevice.createCaptureSession(
                 Arrays.asList(imageReader.getSurface()),
                 new CameraCaptureSession.StateCallback() {
                     @Override
-                    public void onConfigured(CameraCaptureSession session) {
+                    public void onConfigured(@NonNull CameraCaptureSession session) {
                         captureSession = session;
                         try {
                             session.setRepeatingRequest(builder.build(), null, cameraHandler);
-                        } catch (CameraAccessException e) {
+                        } catch (Exception e) {
                             Log.e(TAG, "setRepeatingRequest failed", e);
                         }
                     }
                     @Override
-                    public void onConfigureFailed(CameraCaptureSession session) {
-                        Log.e(TAG, "Session configure failed");
+                    public void onConfigureFailed(@NonNull CameraCaptureSession session) {
+                        Log.e(TAG, "Конфигурация сессии камеры провалилась");
+                        scheduleCameraRetry();
                     }
                 }, cameraHandler);
         } catch (Exception e) {
-            Log.e(TAG, "startPreview failed", e);
+            Log.e(TAG, "Ошибка в startCaptureSession", e);
+            scheduleCameraRetry();
         }
     }
 
-    private void closeCamera() {
+    private void closeCameraStructures() {
         try { if (captureSession != null) { captureSession.close(); captureSession = null; } } catch (Exception ignored) {}
-        try { if (cameraDevice != null) { cameraDevice.close(); cameraDevice = null; } } catch (Exception ignored) {}
         try { if (imageReader != null) { imageReader.close(); imageReader = null; } } catch (Exception ignored) {}
+    }
+
+    private void closeCamera() {
+        closeCameraStructures();
+        try { if (cameraDevice != null) { cameraDevice.close(); cameraDevice = null; } } catch (Exception ignored) {}
         latestFrame.set(null);
     }
 
     private void switchCamera(String cameraId) {
-        cameraHandler.post(() -> openCamera(cameraId));
+        cameraHandler.post(() -> {
+            isCameraConnected = false;
+            closeCamera();
+            openCamera(cameraId);
+        });
     }
 
     private void startHttpServer() {
@@ -181,7 +250,9 @@ public class CameraStreamService extends Service {
             BufferedReader reader = new BufferedReader(new InputStreamReader(client.getInputStream()));
             String requestLine = reader.readLine();
             if (requestLine == null) { client.close(); return; }
-            String path = requestLine.split(" ")[1];
+            String[] tokens = requestLine.split(" ");
+            if (tokens.length < 2) { client.close(); return; }
+            String path = tokens[1];
 
             if (path.startsWith("/front")) {
                 switchCamera("1");
@@ -263,7 +334,8 @@ public class CameraStreamService extends Service {
     private Notification buildNotification() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel ch = new NotificationChannel(CHANNEL_ID, "MJPEG Camera", NotificationManager.IMPORTANCE_LOW);
-            ((NotificationManager) getSystemService(NOTIFICATION_SERVICE)).createNotificationChannel(ch);
+            NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            if (nm != null) nm.createNotificationChannel(ch);
         }
         return new Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("MJPEG Camera")

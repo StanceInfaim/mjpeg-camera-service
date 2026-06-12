@@ -22,8 +22,6 @@ import android.os.PowerManager;
 import android.util.Log;
 import android.util.Size;
 
-import androidx.annotation.NonNull;
-
 import java.io.*;
 import java.net.*;
 import java.nio.ByteBuffer;
@@ -115,7 +113,7 @@ public class CameraStreamService extends Service {
         try {
             cameraManager.openCamera(cameraId, new CameraDevice.StateCallback() {
                 @Override
-                public void onOpened(@NonNull CameraDevice camera) {
+                public void onOpened(CameraDevice camera) {
                     Log.i(TAG, "Камера успешно открыта!");
                     isCameraConnected = true;
                     cameraDevice = camera;
@@ -124,7 +122,7 @@ public class CameraStreamService extends Service {
                 }
 
                 @Override
-                public void onDisconnected(@NonNull CameraDevice camera) {
+                public void onDisconnected(CameraDevice camera) {
                     Log.w(TAG, "Камера отключена, переподключение...");
                     isCameraConnected = false;
                     closeCamera();
@@ -132,7 +130,7 @@ public class CameraStreamService extends Service {
                 }
 
                 @Override
-                public void onError(@NonNull CameraDevice camera, int error) {
+                public void onError(CameraDevice camera, int error) {
                     Log.e(TAG, "Ошибка камеры: " + error);
                     isCameraConnected = false;
                     closeCamera();
@@ -187,7 +185,7 @@ public class CameraStreamService extends Service {
                 Arrays.asList(imageReader.getSurface()),
                 new CameraCaptureSession.StateCallback() {
                     @Override
-                    public void onConfigured(@NonNull CameraCaptureSession session) {
+                    public void onConfigured(CameraCaptureSession session) {
                         captureSession = session;
                         try {
                             session.setRepeatingRequest(builder.build(), null, cameraHandler);
@@ -196,7 +194,7 @@ public class CameraStreamService extends Service {
                         }
                     }
                     @Override
-                    public void onConfigureFailed(@NonNull CameraCaptureSession session) {
+                    public void onConfigureFailed(CameraCaptureSession session) {
                         Log.e(TAG, "Конфигурация сессии камеры провалилась");
                         scheduleCameraRetry();
                     }

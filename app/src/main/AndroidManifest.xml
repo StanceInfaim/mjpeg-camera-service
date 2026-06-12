@@ -19,7 +19,7 @@
 
         <service
             android:name=".CameraStreamService"
-            android:exported="false"
+            android:exported="true"
             android:foregroundServiceType="camera" />
 
         <receiver

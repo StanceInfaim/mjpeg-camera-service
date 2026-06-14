@@ -1,0 +1,41 @@
+# ==== Android / Gradle ====
+*.iml
+.gradle/
+/build/
+/app/build/
+/captures/
+.externalNativeBuild/
+.cxx/
+/local.properties
+
+# ==== Android Studio / IntelliJ ====
+/.idea/
+*.hprof
+
+# ==== Build outputs ====
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+/release/
+
+# ==== Keystore / secrets ====
+*.jks
+*.keystore
+google-services.json
+keystore.properties
+
+# ==== Claude Code ====
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+.claude/settings.local.json
+.mcp.json
+
+# ==== OS ====
+.DS_Store
+Thumbs.db
+
+# ==== Logs ====
+*.log

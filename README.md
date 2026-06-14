@@ -64,7 +64,7 @@ Default port is **8080**.
 
 | Setting | Range / values | Notes |
 |---|---|---|
-| Camera | back / front | Camera2 ids `"0"` / `"1"` |
+| Camera | any on the device | Enumerated by lens facing (back/front/external) |
 | Resolution | reported by the device | Sizes marked `(SW)` use software encoding |
 | FPS | 1–60 | Upper bound that the stream is paced to |
 | JPEG quality | 10–95 | Main lever for bandwidth |
@@ -104,7 +104,6 @@ You can install and run the app manually over `adb` without root. Root is requir
 - **No authentication, no TLS.** The stream is open to everyone on the network. Keep the phone on a trusted/isolated LAN.
 - **Bandwidth, not the app, is usually the FPS limit.** At high resolution and quality a single JPEG can be hundreds of KB; on a weak Wi-Fi link that caps the achievable frame rate. Lower the resolution or JPEG quality first.
 - In dim light the camera's auto-exposure lowers the real frame rate to keep images bright, so the delivered FPS can be below the configured cap.
-- Camera ids `"0"`/`"1"` are the Camera2 convention; on some devices the physical mapping differs.
 
 ## Building from source
 

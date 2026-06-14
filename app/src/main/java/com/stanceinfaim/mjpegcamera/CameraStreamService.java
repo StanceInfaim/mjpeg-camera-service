@@ -90,6 +90,7 @@ public class CameraStreamService extends Service {
     private volatile boolean usingYuv = false;
     private volatile List<Size> availableSizes = new ArrayList<>();
     private volatile Set<String> jpegSizeKeys = new HashSet<>(); // "WxH" sizes with hardware JPEG
+    private volatile List<String[]> cameraList = new ArrayList<>(); // {id, facing} for every device camera
 
     // Reused only on cameraHandler (single thread) to avoid per-frame allocation
     private byte[] nv21Buffer;
@@ -124,6 +125,8 @@ public class CameraStreamService extends Service {
         }
 
         cameraManager = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
+        enumerateCameras();
+        currentCameraId = resolveCameraId(currentCameraId);
         cameraThread = new HandlerThread("CameraThread");
         cameraThread.start();
         cameraHandler = new Handler(cameraThread.getLooper());
@@ -193,6 +196,43 @@ public class CameraStreamService extends Service {
     }
 
     // ── Camera (all camera ops run on cameraHandler) ──────────────────────────
+
+    // Enumerate cameras by their reported lens facing instead of assuming "0"=back/"1"=front,
+    // which is only a convention and is wrong on some multi-camera devices.
+    private void enumerateCameras() {
+        List<String[]> list = new ArrayList<>();
+        try {
+            for (String id : cameraManager.getCameraIdList()) {
+                Integer facing = cameraManager.getCameraCharacteristics(id)
+                    .get(CameraCharacteristics.LENS_FACING);
+                String label = facing == null ? "unknown"
+                    : facing == CameraCharacteristics.LENS_FACING_FRONT ? "front"
+                    : facing == CameraCharacteristics.LENS_FACING_BACK ? "back" : "external";
+                list.add(new String[]{id, label});
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "enumerateCameras failed", e);
+        }
+        cameraList = list;
+    }
+
+    private String firstCameraFacing(String facing) {
+        for (String[] c : cameraList) if (c[1].equals(facing)) return c[0];
+        return null;
+    }
+
+    private boolean cameraExists(String id) {
+        for (String[] c : cameraList) if (c[0].equals(id)) return true;
+        return false;
+    }
+
+    // Keep the requested id if the device actually has it, else first back camera, else anything.
+    private String resolveCameraId(String requested) {
+        if (cameraExists(requested)) return requested;
+        String back = firstCameraFacing("back");
+        if (back != null) return back;
+        return cameraList.isEmpty() ? requested : cameraList.get(0)[0];
+    }
 
     private void openCamera(String cameraId) {
         try {
@@ -547,14 +587,20 @@ public class CameraStreamService extends Service {
                     else if ("POST".equals(method)) applySettings(client, body);
                     else sendText(client, "405 Method Not Allowed", "Method not allowed");
                     break;
-                case "/front":
-                    currentCameraId = "1"; savePrefs(); switchCamera("1");
-                    sendJson(client, "200 OK", "{\"ok\":true,\"camera\":\"1\"}");
+                case "/front": {
+                    String id = firstCameraFacing("front");
+                    if (id == null) { sendJson(client, "404 Not Found", "{\"ok\":false,\"error\":\"no front camera\"}"); break; }
+                    currentCameraId = id; savePrefs(); switchCamera(id);
+                    sendJson(client, "200 OK", "{\"ok\":true,\"camera\":\"" + id + "\"}");
                     break;
-                case "/back":
-                    currentCameraId = "0"; savePrefs(); switchCamera("0");
-                    sendJson(client, "200 OK", "{\"ok\":true,\"camera\":\"0\"}");
+                }
+                case "/back": {
+                    String id = firstCameraFacing("back");
+                    if (id == null) { sendJson(client, "404 Not Found", "{\"ok\":false,\"error\":\"no back camera\"}"); break; }
+                    currentCameraId = id; savePrefs(); switchCamera(id);
+                    sendJson(client, "200 OK", "{\"ok\":true,\"camera\":\"" + id + "\"}");
                     break;
+                }
                 case "/shot":
                 case "/capture":
                     serveSnapshot(client);
@@ -655,8 +701,16 @@ public class CameraStreamService extends Service {
             o.put("yuv", !jpegKeys.contains(key(s.getWidth(), s.getHeight())));
             sizes.put(o);
         }
+        JSONArray cameras = new JSONArray();
+        for (String[] c : cameraList) {
+            JSONObject o = new JSONObject();
+            o.put("id", c[0]);
+            o.put("facing", c[1]);
+            cameras.put(o);
+        }
         JSONObject json = new JSONObject();
         json.put("camera_id", currentCameraId);
+        json.put("cameras", cameras);
         json.put("resolution_w", settingResW);
         json.put("resolution_h", settingResH);
         json.put("fps", settingFps);
@@ -678,6 +732,7 @@ public class CameraStreamService extends Service {
         catch (Exception e) { sendJson(client, "400 Bad Request", "{\"ok\":false,\"error\":\"invalid JSON\"}"); return; }
 
         String newCameraId  = req.optString("camera_id", currentCameraId);
+        if (!cameraExists(newCameraId)) newCameraId = currentCameraId; // ignore unknown ids
         int newResW         = req.optInt("resolution_w", settingResW);
         int newResH         = req.optInt("resolution_h", settingResH);
         int newFps          = clamp(req.optInt("fps", settingFps), 1, 60);
@@ -799,7 +854,7 @@ public class CameraStreamService extends Service {
         "<body>\n" +
         "<h1>Camera Settings</h1>\n" +
         "<div class='f'><label>Camera</label>\n" +
-        "<select id='camera_id'><option value='0'>Back (0)</option><option value='1'>Front (1)</option></select></div>\n" +
+        "<select id='camera_id'><option>Loading...</option></select></div>\n" +
         "<div class='f'><label>Resolution</label><select id='resolution'><option>Loading...</option></select></div>\n" +
         "<div class='f'><label>FPS</label>\n" +
         "<select id='fps'><option>5</option><option>10</option><option>15</option><option>20</option><option>25</option><option>30</option></select></div>\n" +
@@ -842,7 +897,15 @@ public class CameraStreamService extends Service {
         "      sel.appendChild(o);\n" +
         "    });\n" +
         "  }\n" +
-        "  sv('camera_id',d.camera_id);\n" +
+        "  var csel=document.getElementById('camera_id');\n" +
+        "  csel.innerHTML='';\n" +
+        "  (d.cameras||[]).forEach(function(c){\n" +
+        "    var o=document.createElement('option');\n" +
+        "    o.value=c.id;\n" +
+        "    o.text=c.facing+' ('+c.id+')';\n" +
+        "    if(c.id===d.camera_id)o.selected=true;\n" +
+        "    csel.appendChild(o);\n" +
+        "  });\n" +
         "  sv('fps',d.fps);\n" +
         "  sv('quality',d.quality);\n" +
         "  sv('rotation',d.rotation);\n" +
